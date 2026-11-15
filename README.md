@@ -40,6 +40,10 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 
 `cargo run --release --example probe -- ws://127.0.0.1:5454 4` checks any SDRconnect endpoint (the bridge or a real SDRconnect): reads the properties msdr reads, then counts spectrum, IQ and audio frames for four seconds.
 
+## tci_diag
+
+`tci_diag` talks to any TCI server directly, without the bridge: `status` (status burst and summary), `watch` (every text line live, binary frames per stream), `iq --rate 500000 --secs 20` (delivered rate, frame sizes, longest pause), `ports --from 50001 --to 50010` (which ports serve TCI, with device and VFO), `spot --call … --mode … --hz … --color 0xAARRGGBB --text …` and `info "text"` (a grey INFO label at the VFO: the return path a decoder will use). `cargo run --release --bin tci_diag -- status`.
+
 ## Kit (in progress)
 
 `kit/tci-kit.toml` holds the kit's settings, its rules in words (`[rules]`), one true/false line for each of msdr's 49 decoders, grouped by what msdr can run together, and each decoder's numbers (`[decoder_facts]`: path, receiver modes, minimum rate, width, programs).
