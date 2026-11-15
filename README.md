@@ -42,7 +42,12 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 
 ## Kit (in progress)
 
-`kit/tci-kit.toml` holds the kit's settings and one true/false line for each of msdr's 49 decoders, grouped by what msdr can run together (raw IQ, or audio in one receiver mode). `kit/make_decoder_config.py`, run with msdr's Python, regenerates it from msdr's own decoder registry and keeps the flags already set. The start script that reads it (bridge, msdr, decoders, TCI SPOT back to the receiver) comes next.
+`kit/tci-kit.toml` holds the kit's settings, its rules in words (`[rules]`), one true/false line for each of msdr's 49 decoders, grouped by what msdr can run together, and each decoder's numbers (`[decoder_facts]`: path, receiver modes, minimum rate, width, programs).
+
+- `python3 kit/check_config.py` checks the file and names every fault with its rule: raw IQ and audio decoders on together, audio decoders without a common receiver mode, an IQ rate below a decoder's minimum, a signal that leaves the IQ window, an unknown decoder id (with the nearest one), a missing program (warning). Exit 1 on any error; tests in `kit/test_check_config.py`.
+- `kit/make_decoder_config.py`, run with msdr's Python, regenerates the file from msdr's own decoder registry and keeps the values and flags already set.
+
+The start script that reads it (bridge, msdr, decoders, TCI SPOT back to the receiver) comes next and runs the check first.
 
 ## Test
 
