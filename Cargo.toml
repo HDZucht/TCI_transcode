@@ -3,7 +3,8 @@ name = "tci_transcode"
 version = "0.1.0"
 edition = "2024"
 description = "Translates a TCI receiver (e.g. SDR Oxide) into the published SDRconnect WebSocket API 1.0.3, so decoder programs written for that API run against any TCI source."
-# Licence: not decided yet (HDZ). Own code only; no SDR Oxide or msdr code is linked or copied.
+license = "MIT"
+# Own code only; no SDR Oxide or msdr code is linked or copied.
 publish = false
 
 [dependencies]

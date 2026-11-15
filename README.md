@@ -5,7 +5,7 @@ version: 0.1.0
 status: mvp-stage-1
 created: 2026-11-14
 author: Hans-Dieter Zucht with Argus (33feb1a0) (Claude Opus 5.5)
-licence: not decided
+licence: MIT
 tags: [sdr, tci, sdrconnect, decoder, bridge, rust]
 ---
 
@@ -40,6 +40,10 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 
 `cargo run --release --example probe -- ws://127.0.0.1:5454 4` checks any SDRconnect endpoint (the bridge or a real SDRconnect): reads the properties msdr reads, then counts spectrum, IQ and audio frames for four seconds.
 
+## Kit (in progress)
+
+`kit/tci-kit.toml` holds the kit's settings and one true/false line for each of msdr's 49 decoders, grouped by what msdr can run together (raw IQ, or audio in one receiver mode). `kit/make_decoder_config.py`, run with msdr's Python, regenerates it from msdr's own decoder registry and keeps the flags already set. The start script that reads it (bridge, msdr, decoders, TCI SPOT back to the receiver) comes next.
+
 ## Test
 
 `cargo test`: 22 unit tests (both protocols, state, spectrum) and one end-to-end run without hardware: a fake TCI server sends a tone 20 kHz above the centre, an SDRconnect client reads the properties, finds the tone in the right spectrum bin, receives IQ and retunes through the bridge.
@@ -51,3 +55,7 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 - msdr's notes on how the real SDRconnect server behaves: https://github.com/gdamdam/msdr (docs/research)
 
 Own code only. No SDR Oxide, SDRconnect or msdr code is linked or copied.
+
+## Licence
+
+MIT, see `LICENSE`. The programs it talks to keep their own licences (SDR Oxide and msdr: GPL-3); TCI_transcode reaches them over the network only.
