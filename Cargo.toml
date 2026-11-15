@@ -1,0 +1,18 @@
+[package]
+name = "tci_transcode"
+version = "0.1.0"
+edition = "2024"
+description = "Translates a TCI receiver (e.g. SDR Oxide) into the published SDRconnect WebSocket API 1.0.3, so decoder programs written for that API run against any TCI source."
+# Licence: not decided yet (HDZ). Own code only; no SDR Oxide or msdr code is linked or copied.
+publish = false
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tokio-tungstenite = "0.28"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rustfft = "6"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
