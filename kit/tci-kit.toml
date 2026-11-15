@@ -26,6 +26,9 @@ iq_window   = "ERROR: a raw IQ decoder's signal must fit the IQ window: tci.vfo_
 names       = "ERROR: every key under [decoders] must be an msdr decoder id, and every value true or false."
 programs    = "WARNING: a decoder whose program is not installed is skipped by msdr."
 none_on     = "WARNING: no decoder is on; the kit starts the bridge and msdr only."
+profile     = "ERROR: each [[profile]] needs a unique name, tci = host:port, decoders = [ids], hz = \"vfo\" or Hz; the rules above apply per profile."
+ports       = "ERROR: every bridge (listen) and every msdr (web_port) needs its own port."
+shared_iq   = "ERROR: profiles on the same TCI server use the same iq_rate: one server sends one IQ stream."
 
 [decoders]
 # Only decoders from one group can be on together (rules no_mix, one_mode). USB/LSB and USB/NFM
@@ -93,6 +96,18 @@ rtty_minimodem = false  # RTTY (minimodem) · minimodem · audio 22.05 kS/s · 2
 
 # ── audio, receiver in USB/NFM (1) ──
 sstv           = false  # SSTV (Robot 36, Martin, Scottie, PD) · built in · audio 11.025 kS/s · 3 kHz wide
+
+# ── more msdr instances ([[profile]]) ──
+# [decoders] above is profile "main": the station radio at [tci], bridge [bridge], msdr [msdr]. Each [[profile]]
+# starts one more bridge + msdr, so decoders of different groups or bands run at the same time. listen and web_port
+# default to the next free ports (5455, 8766, ...); iq_rate defaults to bridge.iq_rate. Example, remove the #:
+#
+# [[profile]]
+# name = "psk20m"
+# tci = "127.0.0.1:50002"        # the RX-888's TCI server (Settings → Servers)
+# decoders = ["psk31"]
+# hz = 14070000                  # or "vfo"
+
 
 [decoder_facts]
 # Generated from msdr 1.0.0rc10; do not edit, rerun make_decoder_config.py instead.

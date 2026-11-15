@@ -66,6 +66,22 @@ iq_window   = "ERROR: a raw IQ decoder's signal must fit the IQ window: tci.vfo_
 names       = "ERROR: every key under [decoders] must be an msdr decoder id, and every value true or false."
 programs    = "WARNING: a decoder whose program is not installed is skipped by msdr."
 none_on     = "WARNING: no decoder is on; the kit starts the bridge and msdr only."
+profile     = "ERROR: each [[profile]] needs a unique name, tci = host:port, decoders = [ids], hz = \\"vfo\\" or Hz; the rules above apply per profile."
+ports       = "ERROR: every bridge (listen) and every msdr (web_port) needs its own port."
+shared_iq   = "ERROR: profiles on the same TCI server use the same iq_rate: one server sends one IQ stream."
+"""
+
+PROFILES_HEAD = """
+# ── more msdr instances ([[profile]]) ──
+# [decoders] above is profile "main": the station radio at [tci], bridge [bridge], msdr [msdr]. Each [[profile]]
+# starts one more bridge + msdr, so decoders of different groups or bands run at the same time. listen and web_port
+# default to the next free ports (5455, 8766, ...); iq_rate defaults to bridge.iq_rate. Example, remove the #:
+#
+# [[profile]]
+# name = "psk20m"
+# tci = "127.0.0.1:50002"        # the RX-888's TCI server (Settings → Servers)
+# decoders = ["psk31"]
+# hz = 14070000                  # or "vfo"
 """
 
 
@@ -142,6 +158,13 @@ def main() -> None:
             note = f"{s.label} · {prog} · {limit} · {khz(s.default_bandwidth_hz)} wide"
             lines.append(f"{s.id.ljust(width)} = {'true ' if on else 'false'}  # {note}")
 
+    lines.append(PROFILES_HEAD)
+    for prof in old.get("profile", []) or []:
+        lines.append("[[profile]]")
+        for k, v in prof.items():
+            val = "[" + ", ".join(json.dumps(x) for x in v) + "]" if isinstance(v, list) else toml_value(v)
+            lines.append(f"{k} = {val}")
+        lines.append("")
     lines.append(f"\n[decoder_facts]\n# Generated from msdr {MSDR_VERSION}; do not edit, rerun make_decoder_config.py instead.")
     for s in sorted(DECODERS.values(), key=lambda s: s.id):
         facts = {

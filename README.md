@@ -49,6 +49,7 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 `kit/tci-kit.toml` holds the kit's settings, its rules in words (`[rules]`), one true/false line for each of msdr's 49 decoders, grouped by what msdr can run together, and each decoder's numbers (`[decoder_facts]`: path, receiver modes, minimum rate, width, programs).
 
 - `python3 kit/check_config.py` checks the file and names every fault with its rule: raw IQ and audio decoders on together, audio decoders without a common receiver mode, an IQ rate below a decoder's minimum, a signal that leaves the IQ window, an unknown decoder id (with the nearest one), a missing program (warning). Exit 1 on any error; tests in `kit/test_check_config.py`.
+- Profiles: `[decoders]` is profile *main* (the station radio). Each `[[profile]]` (name, tci, decoders, hz, optional iq_rate, listen, web_port) starts one more bridge and msdr instance from the same msdr install (`--web-port`, `--db`, `--settings`), so decoders of different groups or bands run at once, e.g. rtl_433 on 433 MHz beside PSK31 on 20 m. The checker applies the rules per profile and adds: unique names and ports, one IQ rate per TCI server.
 - `kit/make_decoder_config.py`, run with msdr's Python, regenerates the file from msdr's own decoder registry and keeps the values and flags already set.
 
 The start script that reads it (bridge, msdr, decoders, TCI SPOT back to the receiver) comes next and runs the check first.

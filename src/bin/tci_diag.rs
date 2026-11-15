@@ -54,7 +54,7 @@ enum Cmd {
     },
     /// Send one SPOT label, keep the connection for --hold seconds, then optionally delete it.
     Spot {
-        #[arg(long, default_value = "TCI-DIAG")]
+        #[arg(long, default_value = "TCI-MSG")]
         call: String,
         #[arg(long, default_value = "INFO")]
         mode: String,
@@ -235,7 +235,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::Spot { call, mode, hz, color, text, hold, delete } => {
             spot(&cli.tci, &call, &mode, hz, parse_color(&color)?, &text, hold, delete).await?
         }
-        Cmd::Info { text, hold } => spot(&cli.tci, "TCI-DIAG", "INFO", None, 0xFF9E_9E9E, &text, hold, true).await?,
+        Cmd::Info { text, hold } => spot(&cli.tci, "TCI-MSG", "INFO", None, 0xFF9E_9E9E, &text, hold, true).await?,
     }
     Ok(())
 }

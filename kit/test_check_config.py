@@ -74,6 +74,38 @@ class Check(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertIn("none_on", rules(warnings))
 
+    def test_profiles_run_beside_main(self):
+        c = cfg(["rtl433"])
+        c["profile"] = [{"name": "psk20m", "tci": "127.0.0.1:50002", "decoders": ["psk31"], "hz": 14070000}]
+        errors, notes = check(c)
+        self.assertEqual(errors, [])
+        self.assertTrue(any("(profile psk20m) set the receiver to USB" in n for n in notes))
+
+    def test_profile_rules_apply_per_profile(self):
+        c = cfg(["rtl433"])
+        c["profile"] = [{"name": "mixed", "tci": "127.0.0.1:50002", "decoders": ["rtl433", "psk31"]}]
+        errors, _ = check(c)
+        self.assertTrue(any(e.startswith("ERROR [no_mix] (profile mixed)") for e in errors))
+
+    def test_profile_ports_must_differ(self):
+        c = cfg(["rtl433"])
+        c["profile"] = [{"name": "a", "tci": "127.0.0.1:50002", "decoders": ["psk31"], "web_port": 8765}]
+        errors, _ = check(c)
+        self.assertIn("ports", rules(errors))
+
+    def test_one_tci_server_one_iq_rate(self):
+        c = cfg(["rtl433"])
+        c["profile"] = [{"name": "ft8", "tci": "127.0.0.1:50001", "decoders": ["ft8"], "iq_rate": 250000}]
+        errors, _ = check(c)
+        self.assertIn("shared_iq", rules(errors))
+
+    def test_profile_typo_and_bad_hz(self):
+        c = cfg(["rtl433"])
+        c["profile"] = [{"name": "x", "tci": "127.0.0.1:50002", "decoders": ["psk32"], "hz": "auto"}]
+        errors, _ = check(c)
+        self.assertTrue(any("did you mean psk31" in e for e in errors))
+        self.assertTrue(any("hz = 'auto'" in e for e in errors))
+
 
 if __name__ == "__main__":
     unittest.main()
