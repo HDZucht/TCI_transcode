@@ -56,6 +56,24 @@ pub const DEFAULT_RATE: u32 = 2_048_000;
 // Why: 2026-11-16, the first block after AbracaDABra connected came at the
 //      bridge's earlier 250 kS/s and switched offset tuning off within 0.4 ms.
 const RATE_SWITCH_GRACE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// How long after a retune the bridge waits for the TCI server to report the
+/// new centre, sending silence meanwhile; and how far the reported centre may
+/// lie from the one asked for (SDR Oxide adds ~28 kHz of its own).
+// Why: HDZ 2026-11-16: right after a channel change the reported centre was
+//      still the old one and the stream came out shifted by the channel step
+//      (+684 to +844 kHz instead of −1,028 kHz); "Glätten nach Kanalwechsel
+//      ist für das Do-it-yourself-Panorama auch noch nötig". Silence is what a
+//      sweep can skip; a spectrum from the wrong frequency it cannot tell.
+const SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_millis(1500);
+const SETTLE_TOLERANCE_HZ: i64 = 150_000;
+
+/// Whether a block whose stream is centred at `center_hz` belongs to the
+/// retune that asked for `expected_hz` `since` ago: yes once the centre is
+/// there, or once the wait is over.
+pub fn settled(center_hz: i64, expected_hz: i64, since: std::time::Duration) -> bool {
+    (center_hz - expected_hz).abs() <= SETTLE_TOLERANCE_HZ || since > SETTLE_LIMIT
+}
+
 /// RMS the AGC aims at, of full scale: −15 dBFS leaves OFDM's peaks room.
 const TARGET_RMS: f32 = 0.178;
 
@@ -223,6 +241,9 @@ async fn client(
     let mut tuned: Option<i64> = None;
     let mut phase = 0f64;
     let mut shift_logged = i64::MIN;
+    // A retune in flight: when it was asked for and the centre it should bring.
+    let mut retune: Option<(std::time::Instant, i64)> = None;
+    let mut muted = 0u64;
     loop {
         tokio::select! {
             r = rd.read_exact(&mut cmd) => {
@@ -237,6 +258,7 @@ async fn client(
                 }
                 if let Cmd::Frequency(hz) = c && lead == Lead::Client {
                     tuned = Some(hz as i64);
+                    retune = Some((std::time::Instant::now(), hz as i64 + tuning.offset_hz));
                 }
                 if let Cmd::Frequency(hz) = c && lead == Lead::Frontend && !lead_warned {
                     tracing::warn!(hz, "rtl_tcp client tunes, but --lead frontend keeps the front end's frequency; start with --lead client to let it");
@@ -266,6 +288,19 @@ async fn client(
                         tracing::info!(from = block.rate, to = want, "rtl_tcp IQ rate");
                         rs = Some(Resampler::new(block.rate, want));
                     }
+                    // Until the server reports the new centre, send silence.
+                    if let Some((t, expected)) = retune {
+                        if settled(block.center_hz, expected, t.elapsed()) {
+                            if muted > 0 {
+                                tracing::debug!(blocks = muted, ms = t.elapsed().as_millis() as u64, "rtl_tcp retune settled");
+                            }
+                            retune = None;
+                            muted = 0;
+                        } else {
+                            muted += 1;
+                        }
+                    }
+                    let silent = retune.is_some();
                     let shift = tuned
                         .map(|f| f - block.center_hz)
                         .filter(|d| block.center_hz != 0 && d.abs() < block.rate as i64 / 2);
@@ -279,6 +314,7 @@ async fn client(
                         }
                         _ => block.data.clone(),
                     };
+                    let data = if silent { vec![0.0; data.len()] } else { data };
                     fl.clear();
                     rs.as_mut().unwrap().process(&data, &mut fl);
                     bytes.clear();
@@ -371,6 +407,18 @@ mod tests {
         for v in out.chunks(2) {
             assert!((v[0] - 1.0).abs() < 1e-3 && v[1].abs() < 1e-3, "{v:?}");
         }
+    }
+
+    #[test]
+    fn a_retune_waits_for_the_new_centre() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // Asked for 238.488 MHz (9A + 1 MHz offset); SDR Oxide reports 28 kHz above.
+        assert!(settled(238_516_125, 238_488_000, ms(10)));
+        // Still the previous channel (1.712 MHz lower): wait.
+        assert!(!settled(236_804_125, 238_488_000, ms(10)));
+        // But not for ever.
+        assert!(settled(236_804_125, 238_488_000, ms(1600)));
     }
 
     #[test]

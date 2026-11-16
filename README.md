@@ -75,7 +75,7 @@ The TCI server needed one fix for this, in SDR Oxide itself: on macOS its client
 - **Gain:** TCI has no command for the receiver's gain. The gain steps an rtl_tcp client sends (AbracaDABra steps through them) are ignored; set the gain in the TCI front end by hand.
 - **8 bit:** rtl_tcp carries unsigned 8-bit IQ. Enough for DAB+; tight for weak HF signals beside strong ones.
 - **One radio, one IQ rate:** TCI has one IQ rate per radio, and the bridge one subscription. Two clients that want different rates (msdr at 500 kS/s and a DAB program at 2.048 MS/s) do not run on one bridge yet.
-- **Retuning:** for a moment after a channel change the centre the server reports and the samples disagree, and the shift is wrong for a few blocks; a DAB scan rides over it.
+- **Retuning:** after a frequency command the bridge sends silence until the TCI server reports the new centre (at most 1.5 s), so a sweep sees zeros, not a spectrum shifted by the channel step. A real RTL-SDR also delivers a few unusable samples while it retunes.
 - **Offset tuning** needs about 5 MS/s at the receiver; below that a client falls back to tuning on its frequency, DC spike included.
 - Tested with SDR Oxide as the TCI server on macOS. Other TCI servers (ExpertSDR3, Thetis) follow the same protocol and are untested.
 
