@@ -19,11 +19,11 @@ DST="${SNAPSHOT_DST:-$HOME/repos/TCI_transcode}"
 [ -d "$DST/.git" ] || { echo "no git snapshot at $DST"; exit 1; }
 # Pitfall (RadioHanze 2026-10-21): --delete-excluded removed .git; excluded files are left alone by rsync instead.
 rsync -a --delete \
-  --exclude .git --exclude target --exclude .gitignore --exclude .DS_Store \
+  --exclude .git --exclude target --exclude .gitignore --exclude .DS_Store --exclude __pycache__ \
   --exclude 'TCI_transcode - *.md' --exclude 'Recherche - *.md' \
   "$HERE/" "$DST/"
 find "$DST" -path "$DST/.git" -prune -o \
-  \( -name 'TCI_transcode - *.md' -o -name 'Recherche - *.md' -o -name .DS_Store \) \
+  \( -name 'TCI_transcode - *.md' -o -name 'Recherche - *.md' -o -name .DS_Store -o -name __pycache__ \) \
   -print0 | xargs -0 rm -rf
 [ -d "$DST/.git" ] || { echo "SNAPSHOT BROKE .git in $DST"; exit 2; }
 git -C "$DST" status --short

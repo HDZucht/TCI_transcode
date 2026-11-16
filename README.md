@@ -2,7 +2,7 @@
 title: TCI_transcode — a TCI receiver offered as the SDRconnect WebSocket API
 type: software
 version: 0.1.1
-status: mvp-stage-1
+status: working, use case A proven (DAB+ via rtl_tcp)
 created: 2026-11-14
 author: Hans-Dieter Zucht with Argus (33feb1a0) (Claude Opus 5.5)
 licence: MIT
@@ -45,6 +45,37 @@ Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the I
 `RUST_LOG=tci_transcode=debug` logs the TCI conversation both ways and counts the stream frames.
 
 `cargo run --release --example probe -- ws://127.0.0.1:5454 4` checks any SDRconnect endpoint (the bridge or a real SDRconnect): reads the properties msdr reads, then counts spectrum, IQ and audio frames for four seconds.
+
+## Use case A: DAB+ from SDR Oxide in AbracaDABra (macOS)
+
+Proof that the product works end to end, 2026-11-16, Mac mini M6 (32 GB, macOS 27), SDRplay RSP1A at 6 MS/s in SDR Oxide (TCI server on 127.0.0.1:50001, gain set by hand), TCI_transcode 0.1.1, AbracaDABra 4.3.0 as an rtl_tcp client.
+
+```sh
+tci_transcode --tci 127.0.0.1:50001 --lead client --rtltcp 127.0.0.1:1234
+# AbracaDABra: Settings → Device → RTL TCP, 127.0.0.1, port 1234, Connect; then scan
+```
+
+- AbracaDABra sees a "Generic RTL2832U, R820T, uint8" and tunes Band III itself; the scan found 59 services and more.
+- WDR 2 Aachen plays on channel 9A (202.928 MHz, ensemble WDR Regional, 11 services) with slideshow and labels: frequency offset 66.7 Hz, Reed-Solomon uncorrectable 0, audio CRC errors 0, SNR 5.6 dB.
+- SDR Oxide sits 1 MHz above the channel (offset tuning keeps the RSP1A's DC spike out of the block); the bridge takes the 6 MS/s TCI stream, shifts the channel to zero and cuts out 2.048 MS/s.
+- Load, per process in percent of one core: TCI_transcode about 10 % (25 MB), SDR Oxide about 29 %, AbracaDABra about 11 %; the whole chain uses about 4 % of the machine.
+
+![SDR Oxide: RSP1A tuned 1 MHz above DAB channel 9A](docs/use-case-a/sdroxide-rsp1a-offset-tuning.png)
+
+![AbracaDABra: ensemble WDR Regional on 9A through TCI_transcode, RS uncorrectable 0](docs/use-case-a/abracadabra-ensemble-wdr-regional-9a.png)
+
+![AbracaDABra: spectrum of 9A as the bridge delivers it](docs/use-case-a/abracadabra-spectrum-9a.png)
+
+The TCI server needed one fix for this, in SDR Oxide itself: on macOS its client sockets were left non-blocking and dropped clients at high IQ rates (PR to SDR Oxide prepared).
+
+## Limits
+
+- **Gain:** TCI has no command for the receiver's gain. The gain steps an rtl_tcp client sends (AbracaDABra steps through them) are ignored; set the gain in the TCI front end by hand.
+- **8 bit:** rtl_tcp carries unsigned 8-bit IQ. Enough for DAB+; tight for weak HF signals beside strong ones.
+- **One radio, one IQ rate:** TCI has one IQ rate per radio, and the bridge one subscription. Two clients that want different rates (msdr at 500 kS/s and a DAB program at 2.048 MS/s) do not run on one bridge yet.
+- **Retuning:** for a moment after a channel change the centre the server reports and the samples disagree, and the shift is wrong for a few blocks; a DAB scan rides over it.
+- **Offset tuning** needs about 5 MS/s at the receiver; below that a client falls back to tuning on its frequency, DC spike included.
+- Tested with SDR Oxide as the TCI server on macOS. Other TCI servers (ExpertSDR3, Thetis) follow the same protocol and are untested.
 
 ## tci_diag
 

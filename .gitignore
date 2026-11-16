@@ -1,3 +1,4 @@
 target/
 .DS_Store
 *.cs16
+__pycache__/
