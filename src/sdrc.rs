@@ -10,21 +10,43 @@
 //!
 //! Every value goes out as a string, as the spec says. Incoming values are
 //! accepted as strings, numbers or booleans: real clients send all three.
+//!
+//! Ends:     answer an SDRconnect client exactly as SDRconnect would for one tuner, so its code runs unchanged.
+//! Ways:     `handle` turns one client text frame into an `Outcome` (reply to sender, broadcast to all, TCI
+//!           commands) without doing any I/O; frame builders encode binary payloads.
+//! Means:    serde_json; state.rs for values and mode mapping; tci.rs `cmd` for outgoing commands.
+//! Provides: `handle`, `Outcome`, `Streams`, `message`, `property_changed`, `frame`, `iq_frame`, `audio_frame`,
+//!           `PAYLOAD_AUDIO`/`PAYLOAD_IQ`/`PAYLOAD_SPECTRUM`.
+//! Expects:  the caller holds the `State` lock during `handle` and sends the `Outcome` afterwards (main.rs
+//!           `client`); one `Streams` per connection.
+//! Ensures:  radio-bound sets are never stored locally: they become TCI commands and show up when the server
+//!           echoes them; refused sets are answered with the value that holds; values out are always strings.
+//! Fails:    malformed JSON, a secondary-device request or an unknown event yields an empty `Outcome` (silence,
+//!           as for an unsupported feature); float samples beyond ±1 are clipped.
+//! Tags:     #sdrconnect #net
+//! See:      state.rs (`value`, `RADIO_BOUND`, `Lead`), main.rs `client`, examples/probe.rs (a client to check it).
 
 use serde_json::{Value, json};
 
 use crate::state::{Lead, RADIO_BOUND, State, sdrc_to_tci};
 use crate::tci;
 
+/// Binary payload type: audio PCM16 stereo L,R, 48 kHz.
 pub const PAYLOAD_AUDIO: u16 = 1;
+/// Binary payload type: IQ int16 interleaved I,Q.
 pub const PAYLOAD_IQ: u16 = 2;
+/// Binary payload type: spectrum, uint8 per bin, lowest frequency first.
 pub const PAYLOAD_SPECTRUM: u16 = 3;
 
 /// Which binary streams one client connection has switched on.
+/// All off at connect; each connection switches its own (msdr opens one per stream).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Streams {
+    /// `iq_stream_enable`.
     pub iq: bool,
+    /// `audio_stream_enable`.
     pub audio: bool,
+    /// `spectrum_enable`.
     pub spectrum: bool,
 }
 
@@ -39,15 +61,23 @@ pub struct Outcome {
     pub tci: Vec<String>,
 }
 
+/// One SDRconnect text frame: `{event_type, property, device: "primary", value}`
+/// as a JSON string. `value` is always a string, as the API specifies.
 pub fn message(event_type: &str, property: &str, value: &str) -> String {
     json!({ "event_type": event_type, "property": property, "device": "primary", "value": value })
         .to_string()
 }
 
+/// A `property_changed` frame with the current value of `prop`, or `None` when
+/// the bridge does not know `prop`.
 pub fn property_changed(state: &State, prop: &str) -> Option<String> {
     state.value(prop).map(|v| message("property_changed", prop, &v))
 }
 
+/// An incoming `value` as text: strings as they are, booleans and numbers
+/// spelled out, anything else (absent, null, array, object) as "".
+// Why: the spec says strings, but real clients send numbers and booleans too
+//      (the tests below use all three); refusing them would break those clients.
 fn value_text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
@@ -57,17 +87,24 @@ fn value_text(v: Option<&Value>) -> String {
     }
 }
 
+/// "true" or "1", any case, surrounding blanks ignored; everything else is false.
 fn truthy(s: &str) -> bool {
     matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "1")
 }
 
 /// Handle one text frame from a client.
+///
+/// In: the shared `state` (caller holds its lock), this connection's `streams`,
+/// the raw text. Out: an `Outcome`; no I/O happens here. Side effects: local
+/// properties and stream switches change in place.
 pub fn handle(state: &mut State, streams: &mut Streams, text: &str) -> Outcome {
     let mut out = Outcome::default();
+    // Not JSON: no answer, no error frame.
     let Ok(msg) = serde_json::from_str::<Value>(text) else {
         return out;
     };
     // The bridge has one tuner; requests for the secondary get no answer.
+    // A missing `device` counts as primary.
     if msg.get("device").and_then(Value::as_str).is_some_and(|d| d != "primary") {
         return out;
     }
@@ -76,12 +113,14 @@ pub fn handle(state: &mut State, streams: &mut Streams, text: &str) -> Outcome {
     let value = value_text(msg.get("value"));
 
     match event {
+        // Unknown property: no reply at all, rather than an invented value.
         "get_property" => {
             if let Some(v) = state.value(prop) {
                 out.reply.push(message("get_property_response", prop, &v));
             }
         }
         "set_property" => set_property(state, prop, value, &mut out),
+        // Stream switches act on this connection only; the value is the switch.
         "iq_stream_enable" => streams.iq = truthy(&value),
         "audio_stream_enable" => streams.audio = truthy(&value),
         "spectrum_enable" => streams.spectrum = truthy(&value),
@@ -92,10 +131,15 @@ pub fn handle(state: &mut State, streams: &mut Streams, text: &str) -> Outcome {
     out
 }
 
+/// Apply a `set_property`: radio-bound → TCI command (or a refusal echo),
+/// local → store and echo to all, anything else → ignored (logged at debug).
 fn set_property(state: &mut State, prop: &str, value: String, out: &mut Outcome) {
     if RADIO_BOUND.contains(&prop) {
         // The IQ rate is the bridge's own subscription, not the operator's
         // radio, so a client may always choose it.
+        // Pitfall: arm order matters. `device_sample_rate` must stay above the
+        //          `Lead::Frontend` guard, or a frontend-led bridge would refuse rates.
+        // Numbers are parsed as f64 first, so "2048000.0" or 2.048e6 works too.
         let command = match prop {
             "device_sample_rate" => value.parse::<f64>().ok().map(|r| tci::cmd::iq_samplerate(r as u32)),
             _ if state.lead == Lead::Frontend => None,
@@ -106,11 +150,15 @@ fn set_property(state: &mut State, prop: &str, value: String, out: &mut Outcome)
         };
         match command {
             // The change is reported when the TCI server echoes it.
+            // Invariant: State is not touched here; it only ever holds what the
+            //            server reports, so a refused or snapped value never shows.
             Some(c) => out.tci.push(c),
             // Refused or unparseable: tell the client what holds instead.
             None => out.broadcast.extend(property_changed(state, prop)),
         }
     } else if state.is_local(prop) {
+        // Local: kept, and echoed to every connection, so each of a client's
+        // connections sees the new value.
         state.set_local(prop, value);
         out.broadcast.extend(property_changed(state, prop));
     } else {
@@ -119,6 +167,7 @@ fn set_property(state: &mut State, prop: &str, value: String, out: &mut Outcome)
 }
 
 /// A binary frame: payload type, then the payload.
+/// The type goes first as u16 little-endian.
 pub fn frame(payload_type: u16, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + payload.len());
     out.extend_from_slice(&payload_type.to_le_bytes());
@@ -126,11 +175,13 @@ pub fn frame(payload_type: u16, payload: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Float sample (full scale ±1) → int16, clipped; ±1 maps to ±32767 (symmetric, so −32768 never occurs).
 fn to_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0).round() as i16
 }
 
 /// IQ frame from interleaved float32 I,Q (full scale ±1).
+/// Out: payload type 2, then int16 little-endian I,Q,I,Q …
 pub fn iq_frame(iq: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + iq.len() * 2);
     out.extend_from_slice(&PAYLOAD_IQ.to_le_bytes());
@@ -142,10 +193,14 @@ pub fn iq_frame(iq: &[f32]) -> Vec<u8> {
 
 /// Audio frame, PCM16 stereo L,R, from float32 audio with `channels`
 /// interleaved channels (1 is duplicated to both ears).
+///
+/// Pitfall: any `channels` other than 1 is passed through as it is, so the
+/// input must already be stereo (main.rs makes it so before calling).
 pub fn audio_frame(audio: &[f32], channels: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + audio.len() * 4);
     out.extend_from_slice(&PAYLOAD_AUDIO.to_le_bytes());
     if channels == 1 {
+        // Mono: each sample twice, L then R.
         for &s in audio {
             let b = to_i16(s).to_le_bytes();
             out.extend_from_slice(&b);
@@ -159,14 +214,21 @@ pub fn audio_frame(audio: &[f32], channels: u32) -> Vec<u8> {
     out
 }
 
+/// Proves: gets answer with strings; unknown gets stay silent; the frontend lead
+/// refuses tuning with the current value; the client lead forwards it; the sample
+/// rate is always the client's; local properties are kept and echoed; stream
+/// switches are per connection; the secondary device is not served; binary
+/// frames carry the type and int16.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// JSON text → Value, panicking on bad JSON (tests only).
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
     }
 
+    /// A numeric property is answered as a string ("250000", not 250000).
     #[test]
     fn get_answers_with_a_string_value() {
         let mut st = State::new(Lead::Frontend);
@@ -182,6 +244,7 @@ mod tests {
         assert_eq!(r["value"], "250000");
     }
 
+    /// No invented values for properties the bridge does not know.
     #[test]
     fn unknown_get_gets_no_answer() {
         let mut st = State::new(Lead::Frontend);
@@ -193,6 +256,7 @@ mod tests {
         assert!(o.reply.is_empty());
     }
 
+    /// Frontend lead: no TCI command, and the client is told the VFO it already had.
     #[test]
     fn frontend_lead_refuses_tuning_with_the_current_value() {
         let mut st = State::new(Lead::Frontend);
@@ -206,6 +270,7 @@ mod tests {
         assert_eq!(parse(&o.broadcast[0])["value"], "433920000");
     }
 
+    /// Client lead: a numeric VFO and a mode name become TCI commands.
     #[test]
     fn client_lead_forwards_tuning_to_tci() {
         let mut st = State::new(Lead::Client);
@@ -224,6 +289,7 @@ mod tests {
         assert_eq!(o.tci, vec!["modulation:0,nfm;"]);
     }
 
+    /// Even with the frontend leading, a rate request goes to TCI.
     #[test]
     fn sample_rate_is_always_the_clients_to_choose() {
         let mut st = State::new(Lead::Frontend);
@@ -235,6 +301,7 @@ mod tests {
         assert_eq!(o.tci, vec!["iq_samplerate:2400000;"]);
     }
 
+    /// A boolean JSON value is stored and echoed as the string "true".
     #[test]
     fn local_properties_are_kept_and_echoed() {
         let mut st = State::new(Lead::Frontend);
@@ -247,6 +314,7 @@ mod tests {
         assert_eq!(st.value("squelch_enable").unwrap(), "true");
     }
 
+    /// Switches land in the connection's own `Streams`, audio stays off.
     #[test]
     fn stream_switches_are_per_connection() {
         let mut st = State::new(Lead::Frontend);
@@ -256,6 +324,7 @@ mod tests {
         assert_eq!(sm, Streams { iq: true, audio: false, spectrum: true });
     }
 
+    /// A request for the second tuner produces nothing at all.
     #[test]
     fn secondary_device_is_not_served() {
         let mut st = State::new(Lead::Client);
@@ -267,6 +336,7 @@ mod tests {
         assert_eq!(o, Outcome::default());
     }
 
+    /// IQ: type 2, values clipped to ±32767. Audio mono: type 1, one sample → one stereo pair.
     #[test]
     fn binary_frames_carry_type_and_int16() {
         let f = iq_frame(&[1.0, -1.0, 0.0, 2.0]);

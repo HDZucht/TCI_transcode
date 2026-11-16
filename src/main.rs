@@ -15,6 +15,27 @@
 //!
 //! Beside it, the same IQ as an rtl_tcp server (`--rtltcp`, port 1234 as the
 //! reference rtl_tcp): resampled to the client's rate, unsigned 8 bit.
+//!
+//! Ends:     run one bridge process that keeps a TCI link alive and serves its receiver to any number of
+//!           SDRconnect and rtl_tcp clients at once.
+//! Ways:     one task `tci_link` (reads TCI, fans out on broadcast channels, writes commands from one mpsc
+//!           queue), one task per SDRconnect client (`client`), and rtltcp.rs's tasks per rtl_tcp client; shared
+//!           `State` behind a mutex.
+//! Means:    tokio, tokio-tungstenite, futures-util, clap, tracing; modules chunk, resample, rtltcp, sdrc,
+//!           spectrum, state, tci.
+//! Provides: CLI `tci_transcode [--tci host:port] [--listen host:port] [--iq-rate S/s] [--lead frontend|client]
+//!           [--rtltcp host:port|off] [--rtltcp-offset-khz kHz]`.
+//! Expects:  a TCI server at `--tci` (it may come and go; the link retries); free ports for `--listen` and
+//!           `--rtltcp`.
+//! Ensures:  a lost TCI link is retried with back-off 0.5 s … 10 s and reported to clients as `started=false`;
+//!           a slow client never stalls the TCI link or other clients; `iq_raw` costs nothing without an rtl_tcp
+//!           client.
+//! Fails:    `--listen` cannot bind → exit 1; `--rtltcp` cannot bind → warning, rtl_tcp off, bridge runs on;
+//!           non-float32 TCI frames → skipped with one warning.
+//! Tags:     #tci #sdrconnect #rtltcp #net
+//! See:      AGENTS.md (architecture, invariants, measured partners), README.md, e2e tests at the end of this file.
+//! Proves:   (tests module `e2e`) a tone, tuning and all three streams cross the bridge over real sockets; rtl_tcp
+//!           header, commands and the shifted tone arrive end to end.
 
 mod chunk;
 mod resample;
@@ -35,6 +56,9 @@ use tokio_tungstenite::tungstenite::{Bytes, Message};
 
 use crate::state::{Lead, State};
 
+// Command line of the bridge.
+// Pitfall: `//`, not `///`, above this struct: clap turns a doc comment
+//          here into the --help text and would replace the Cargo description.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -61,32 +85,50 @@ struct Args {
     rtltcp_offset_khz: i64,
 }
 
+/// Everything the tasks share: the receiver's state, the fan-out channels to
+/// clients, and the one queue of commands to the TCI server.
+///
+/// Broadcast channels drop the oldest item for a receiver that falls behind
+/// (`RecvError::Lagged`); that is the back-pressure by design.
 struct Bridge {
+    /// The receiver as last reported by TCI, plus local properties.
+    // Pitfall: a std Mutex, held only for short, non-async sections; never
+    //          hold it across an `.await`.
     state: Mutex<State>,
     /// property_changed lines for every client.
     events: broadcast::Sender<String>,
+    /// SDRconnect IQ frames (payload type 2, int16), 20 ms each.
     iq: broadcast::Sender<Bytes>,
     /// The TCI server's IQ as it came, for the rtl_tcp side.
     iq_raw: broadcast::Sender<Arc<rtltcp::RawIq>>,
+    /// SDRconnect audio frames (payload type 1, PCM16 stereo), 20 ms each.
     audio: broadcast::Sender<Bytes>,
+    /// SDRconnect spectrum frames (payload type 3, 512 × uint8), ~23 a second.
     spectrum: broadcast::Sender<Bytes>,
     /// Commands for the TCI server.
     to_tci: mpsc::UnboundedSender<String>,
 }
 
 impl Bridge {
+    /// Broadcast a `property_changed` for each name in `props` with its current
+    /// value; names the state does not know are skipped. Holds the state lock
+    /// while sending (broadcast send does not block).
     fn announce(&self, props: &[&str]) {
         let st = self.state.lock().unwrap();
         for p in props {
             if let Some(line) = sdrc::property_changed(&st, p) {
+                // Err = no client subscribed right now; nothing to do.
                 let _ = self.events.send(line);
             }
         }
     }
 }
 
+/// Start logging, the TCI link, the rtl_tcp listener (unless `off`) and the
+/// SDRconnect listener; then serve SDRconnect clients for ever.
 #[tokio::main]
 async fn main() {
+    // Log level from RUST_LOG, default info for this crate only.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -97,6 +139,7 @@ async fn main() {
     let (bridge, from_bridge) = new_bridge(args.lead);
     tokio::spawn(tci_link(bridge.clone(), args.tci.clone(), args.iq_rate, from_bridge));
 
+    // The SDRconnect port is the bridge's reason to exist: without it, exit.
     let listener = match TcpListener::bind(&args.listen).await {
         Ok(l) => l,
         Err(e) => {
@@ -104,6 +147,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // rtl_tcp is optional: a busy port turns it off with a warning, the rest runs.
     if args.rtltcp != "off" {
         match TcpListener::bind(&args.rtltcp).await {
             Ok(l) => {
@@ -119,8 +163,15 @@ async fn main() {
     serve(listener, bridge).await;
 }
 
+/// Build the shared `Bridge` and the receiving end of its TCI command queue
+/// (handed to `tci_link`). Channel capacities set how much a slow client may
+/// fall behind before it loses items.
 fn new_bridge(lead: Lead) -> (Arc<Bridge>, mpsc::UnboundedReceiver<String>) {
     let (to_tci, from_bridge) = mpsc::unbounded_channel();
+    // Capacities, in items: events 256 lines; iq and audio 64 frames of 20 ms
+    // (≈1.3 s); iq_raw 512 TCI blocks (≈1.3–2.5 s at 200–400 blocks/s);
+    // spectrum 16 frames (≈0.7 s at 23/s). The `.0` keeps the sender; receivers
+    // are made per client with `subscribe()`.
     let bridge = Arc::new(Bridge {
         state: Mutex::new(State::new(lead)),
         events: broadcast::channel(256).0,
@@ -134,6 +185,7 @@ fn new_bridge(lead: Lead) -> (Arc<Bridge>, mpsc::UnboundedReceiver<String>) {
 }
 
 /// Accept SDRconnect clients for ever.
+/// One task per connection; an accept error is logged and the loop goes on.
 async fn serve(listener: TcpListener, bridge: Arc<Bridge>) {
     loop {
         match listener.accept().await {
@@ -147,6 +199,12 @@ async fn serve(listener: TcpListener, bridge: Arc<Bridge>) {
 }
 
 /// Keep a connection to the TCI server, reconnecting with backoff.
+///
+/// In: the bridge, the server's host:port, the starting IQ rate (S/s), the
+/// queue of commands from clients. Never returns. Per connection: subscribe
+/// after `ready;`, fold status lines into `State` and announce changes, turn
+/// binary frames into the SDRconnect streams and `iq_raw`, and write queued
+/// commands to the server.
 async fn tci_link(
     bridge: Arc<Bridge>,
     addr: String,
@@ -155,31 +213,39 @@ async fn tci_link(
 ) {
     let url = format!("ws://{addr}");
     let mut backoff = Duration::from_millis(500);
+    // Per-stream processors live across reconnects; each resets itself when the rate changes.
     let mut spec = spectrum::Spectrum::new();
+    // Reused float buffer for each frame's payload.
     let mut samples = Vec::new();
     // The IQ rate to subscribe at: the command line's, until a client sets one.
     let mut want_rate = iq_rate;
     let mut iq_chunks = chunk::Chunker::new(2);
     let mut audio_chunks = chunk::Chunker::new(2);
+    // Frames seen per stream [IQ, audio], for the debug log only.
     let mut counts = [0u32; 2];
     let mut format_warned = false;
     loop {
         match tokio_tungstenite::connect_async(&url).await {
             Ok((ws, _)) => {
                 tracing::info!(%url, "TCI connected");
+                // A good connection resets the back-off for the next loss.
                 backoff = Duration::from_millis(500);
                 let (mut tx, mut rx) = ws.split();
                 let mut last_metrics = Instant::now();
                 loop {
                     tokio::select! {
+                        // Server → bridge.
                         msg = rx.next() => match msg {
                             Some(Ok(Message::Text(t))) => {
                                 tracing::debug!(line = %t.as_str(), "from TCI");
+                                // One text frame may hold many `;`-terminated commands.
                                 for (name, args) in tci::split_commands(t.as_str()) {
                                     let status = tci::parse_status(&name, &args);
                                     if status == tci::Status::Ready {
                                         // Subscribe once the server's status burst is over, at
                                         // the rate wanted (the server reports its own before).
+                                        // Invariant: want_rate survives a reconnect, so a client's
+                                        //            rate is restored when the server comes back.
                                         let rate = want_rate;
                                         for c in [
                                             tci::cmd::iq_samplerate(rate),
@@ -191,15 +257,19 @@ async fn tci_link(
                                             let _ = tx.send(Message::text(c)).await;
                                         }
                                     }
+                                    // Fold into State (short lock), then announce outside it.
                                     let changed = bridge.state.lock().unwrap().apply(&status);
                                     bridge.announce(&changed);
                                 }
                             }
                             Some(Ok(Message::Binary(b))) => {
+                                // Shorter than a header: not a stream frame, skip.
                                 let Some(h) = tci::parse_header(&b) else { continue };
+                                // One receiver served: receiver 0.
                                 if h.receiver != 0 {
                                     continue;
                                 }
+                                // Only float32 is decoded; warn once, not per frame.
                                 if h.format != tci::FORMAT_FLOAT32 {
                                     if !format_warned {
                                         tracing::warn!(format = h.format, "TCI frame not float32, skipped");
@@ -207,6 +277,7 @@ async fn tci_link(
                                     }
                                     continue;
                                 }
+                                // Debug log: the first frame, then every 500th per stream.
                                 if let tci::Stream::Iq | tci::Stream::RxAudio = h.stream {
                                     let i = if h.stream == tci::Stream::Iq { 0 } else { 1 };
                                     counts[i] += 1;
@@ -217,20 +288,29 @@ async fn tci_link(
                                 tci::payload_f32(&b, &mut samples);
                                 match h.stream {
                                     tci::Stream::Iq => {
+                                        // rtl_tcp side: the raw block with the rate from
+                                        // the header and the centre from the last `dds`.
+                                        // Invariant: copy only while an rtl_tcp client
+                                        //            listens; the copy costs per block.
                                         if bridge.iq_raw.receiver_count() > 0 {
                                             let center_hz = bridge.state.lock().unwrap().center_hz;
                                             let raw = rtltcp::RawIq { rate: h.sample_rate, center_hz, data: samples.clone() };
                                             let _ = bridge.iq_raw.send(Arc::new(raw));
                                         }
+                                        // SDRconnect IQ: gathered to 20 ms frames (see chunk.rs).
                                         if let Some(frame) = iq_chunks.push(&samples, h.sample_rate) {
                                             let _ = bridge.iq.send(Bytes::from(sdrc::iq_frame(&frame)));
                                         }
+                                        // Spectrum and channel metrics from the same IQ.
                                         if let Some(db) = spec.feed(&samples, h.sample_rate) {
                                             publish_spectrum(&bridge, &db, h.sample_rate, &mut last_metrics);
                                         }
                                     }
                                     tci::Stream::RxAudio => {
+                                        // Channels 0 = unset by the server: assume stereo.
                                         let ch = if h.channels == 0 { 2 } else { h.channels };
+                                        // Mono becomes stereo here, so the chunker and
+                                        // audio_frame always see two channels.
                                         let stereo: Vec<f32> = if ch == 1 {
                                             samples.iter().flat_map(|&s| [s, s]).collect()
                                         } else {
@@ -240,15 +320,20 @@ async fn tci_link(
                                             let _ = bridge.audio.send(Bytes::from(sdrc::audio_frame(&frame, 2)));
                                         }
                                     }
+                                    // TX audio, TX chrono, unknown: not served.
                                     _ => {}
                                 }
                             }
+                            // Ping, pong, close: nothing to do here (after a close the next read is None).
                             Some(Ok(_)) => {}
                             Some(Err(e)) => { tracing::warn!("TCI read: {e}"); break; }
                             None => break,
                         },
+                        // Bridge → server: commands from SDRconnect and rtl_tcp clients.
                         Some(c) = commands.recv() => {
                             tracing::debug!(command = %c, "to TCI");
+                            // Remember a requested IQ rate, so the next `ready;`
+                            // (after a reconnect) subscribes at it.
                             if let Some(r) = c.strip_prefix("iq_samplerate:").and_then(|r| r.trim_end_matches(';').parse().ok()) {
                                 want_rate = r;
                             }
@@ -258,25 +343,35 @@ async fn tci_link(
                         }
                     }
                 }
+                // Tell clients the radio is gone (`started` = false) until it is back.
                 tracing::warn!("TCI connection lost");
                 let changed = bridge.state.lock().unwrap().apply(&tci::Status::Stop);
                 bridge.announce(&changed);
             }
             Err(e) => tracing::warn!(%url, "TCI connect failed: {e}"),
         }
+        // Back-off doubles per failure, 0.5 s up to 10 s.
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
 }
 
 /// Send a spectrum frame, and once a second refresh signal power and S/N.
+///
+/// In: dBFS per bin (lowest frequency first), the IQ rate in S/s, the time of
+/// the last metrics update (updated here). Side effects: broadcasts one
+/// spectrum frame; once a second writes `signal_power_db` / `signal_snr_db`
+/// into State and announces both.
 fn publish_spectrum(bridge: &Bridge, db: &[f32], rate: u32, last_metrics: &mut Instant) {
+    // All State work in one short lock; sending happens after it is released.
     let (bytes, metrics_due) = {
         let mut st = bridge.state.lock().unwrap();
+        // Display range from the clients' local properties, dBFS.
         let base = st.local_f32("spectrum_base").unwrap_or(-140.0);
         let reference = st.local_f32("spectrum_ref_level").unwrap_or(-20.0);
         let due = last_metrics.elapsed() >= Duration::from_secs(1);
         if due {
+            // The channel sits at VFO − centre in the spectrum.
             let offset = (st.vfo_hz - st.center_hz) as f64;
             let (p, snr) = spectrum::channel_metrics(db, rate, offset, st.bandwidth_hz());
             st.signal_power_db = p;
@@ -293,6 +388,9 @@ fn publish_spectrum(bridge: &Bridge, db: &[f32], rate: u32, last_metrics: &mut I
 
 /// One SDRconnect client connection. msdr opens several (control, IQ, audio),
 /// each with its own stream switches.
+///
+/// Ends when the client closes, a send fails, or a channel closes. Every
+/// connection receives all property events; binary streams only as switched on.
 async fn client(bridge: Arc<Bridge>, stream: TcpStream) {
     let ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
@@ -302,6 +400,8 @@ async fn client(bridge: Arc<Bridge>, stream: TcpStream) {
         }
     };
     let (mut tx, mut rx) = ws.split();
+    // Subscribe to everything at once; a stream that is switched off is
+    // received and dropped (see `forward!`), so switching on needs no resubscribe.
     let mut events = bridge.events.subscribe();
     let mut iq = bridge.iq.subscribe();
     let mut audio = bridge.audio.subscribe();
@@ -309,6 +409,8 @@ async fn client(bridge: Arc<Bridge>, stream: TcpStream) {
     let mut streams = sdrc::Streams::default();
 
     // A lagging receiver lost frames; that is the intended back-pressure.
+    // `forward!(result, switched_on)`: send a binary frame if switched on;
+    // `break` the loop when the client is gone or the channel closed.
     macro_rules! forward {
         ($r:expr, $on:expr) => {
             match $r {
@@ -325,8 +427,10 @@ async fn client(bridge: Arc<Bridge>, stream: TcpStream) {
 
     loop {
         tokio::select! {
+            // Client → bridge: JSON text.
             msg = rx.next() => match msg {
                 Some(Ok(Message::Text(t))) => {
+                    // Handle under the lock, send after releasing it.
                     let out = {
                         let mut st = bridge.state.lock().unwrap();
                         sdrc::handle(&mut st, &mut streams, t.as_str())
@@ -344,15 +448,19 @@ async fn client(bridge: Arc<Bridge>, stream: TcpStream) {
                     }
                 }
                 Some(Ok(Message::Close(_))) | None => break,
+                // Binary or ping from a client: nothing to do.
                 Some(Ok(_)) => {}
                 Some(Err(e)) => { tracing::debug!("client read: {e}"); break; }
             },
+            // Bridge → client: property events, never dropped silently.
             ev = events.recv() => match ev {
                 Ok(line) => {
                     if tx.send(Message::text(line)).await.is_err() {
                         break;
                     }
                 }
+                // Missed events are worth a warning: the client's view of the
+                // properties may now be stale.
                 Err(broadcast::error::RecvError::Lagged(n)) => tracing::warn!(n, "client missed property events"),
                 Err(broadcast::error::RecvError::Closed) => break,
             },
@@ -372,11 +480,16 @@ mod e2e {
     use serde_json::Value;
     use tokio::time::timeout;
 
+    /// The fake server's DDS centre, Hz.
     const CENTER: i64 = 433_900_000;
+    /// The fake tone's distance above the centre, Hz.
     const TONE_OFFSET: f64 = 20_000.0;
 
     /// Accepts one TCI client, sends the status burst, echoes tuning, and
     /// streams the tone once IQ is started. Every command received is kept.
+    ///
+    /// The tone: amplitude 0.5 (−6 dBFS), in 5 ms blocks at the
+    /// rate last asked for. The centre stays at CENTER whatever `dds` says.
     async fn fake_tci(listener: TcpListener, seen: Arc<Mutex<Vec<String>>>) {
         let (stream, _) = listener.accept().await.unwrap();
         let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -398,6 +511,7 @@ mod e2e {
                     for (name, args) in tci::split_commands(t.as_str()) {
                         seen.lock().unwrap().push(format!("{name}:{}", args.join(",")));
                         match name.as_str() {
+                            // Takes any rate as asked and confirms it.
                             "iq_samplerate" => {
                                 rate = args[0].parse().unwrap();
                                 tx.send(Message::text(format!("iq_samplerate:{rate};"))).await.unwrap();
@@ -410,6 +524,7 @@ mod e2e {
                         }
                     }
                 }
+                // Every 5 ms, rate/200 samples of the tone.
                 _ = tick.tick(), if streaming && rate > 0 => {
                     let n = rate as usize / 200;
                     let step = 2.0 * std::f64::consts::PI * TONE_OFFSET / rate as f64;
@@ -428,8 +543,10 @@ mod e2e {
         }
     }
 
+    /// A client-side WebSocket.
     type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>;
 
+    /// Send one SDRconnect JSON message.
     async fn send(ws: &mut Ws, event: &str, prop: &str, value: &str) {
         let m = serde_json::json!({"event_type": event, "property": prop, "value": value});
         ws.send(Message::text(m.to_string())).await.unwrap();
@@ -448,11 +565,13 @@ mod e2e {
         }
     }
 
+    /// get_property and wait for its response value.
     async fn get(ws: &mut Ws, prop: &str) -> String {
         send(ws, "get_property", prop, "").await;
         expect(ws, "get_property_response", prop).await
     }
 
+    /// Next binary frame of `payload_type`, whole (type bytes included).
     async fn next_binary(ws: &mut Ws, payload_type: u16) -> Vec<u8> {
         loop {
             if let Message::Binary(b) = ws.next().await.unwrap().unwrap() {
@@ -463,9 +582,12 @@ mod e2e {
         }
     }
 
+    /// SDRconnect end to end: properties from the burst, the tone in the right
+    /// spectrum bin, int16 IQ frames, and tuning forwarded with the client leading.
     #[tokio::test(flavor = "multi_thread")]
     async fn tone_tuning_and_streams_cross_the_bridge() {
         let seen = Arc::new(Mutex::new(Vec::new()));
+        // Port 0: the OS picks a free port, so tests never collide with a running bridge.
         let tci_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let tci_addr = tci_listener.local_addr().unwrap().to_string();
         tokio::spawn(fake_tci(tci_listener, seen.clone()));
@@ -478,6 +600,7 @@ mod e2e {
 
         timeout(Duration::from_secs(10), async {
             let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+            // Poll until the subscription went through and the server confirmed the rate.
             while get(&mut ws, "device_sample_rate").await != "250000" {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -531,6 +654,8 @@ mod e2e {
         let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let raddr = rl.local_addr().unwrap();
         let (iq, to_tci) = (bridge.iq_raw.clone(), bridge.to_tci.clone());
+        // Offset 0: tune on the frequency. The fake server keeps its centre at
+        // CENTER whatever `dds` asks, so the shift is what gets tested.
         let tuning = rtltcp::Tuning { lead: Lead::Client, offset_hz: 0 };
         tokio::spawn(rtltcp::serve(rl, iq, to_tci, tuning));
 
@@ -539,6 +664,7 @@ mod e2e {
             let mut head = [0u8; 12];
             s.read_exact(&mut head).await.unwrap();
             assert_eq!(&head[..4], b"RTL0");
+            // Two commands in one write: rate 2.048 MS/s, then 433.95 MHz.
             let mut cmd = vec![0x02];
             cmd.extend_from_slice(&2_048_000u32.to_be_bytes());
             cmd.push(0x01);
@@ -570,6 +696,7 @@ mod e2e {
         // shows 30 kHz below the client's frequency.
         let want = TONE_OFFSET - (433_950_000 - CENTER) as f64;
         assert!((f - want).abs() < 200.0, "tone at {f:.0} Hz, want {want:.0}");
+        // Level: the pair RMS near the AGC's target of 0.178 (−15 dBFS).
         let power = c.iter().map(|v| v.0 * v.0 + v.1 * v.1).sum::<f64>() / c.len() as f64;
         let rms = power.sqrt() / 127.5;
         assert!(rms > 0.1 && rms < 0.3, "level {rms}");
