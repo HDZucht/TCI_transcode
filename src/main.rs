@@ -12,8 +12,13 @@
 //!
 //! A slow client loses frames rather than holding up the others: binary
 //! streams go through broadcast channels that drop on lag.
+//!
+//! Beside it, the same IQ as an rtl_tcp server (`--rtltcp`, port 1234 as the
+//! reference rtl_tcp): resampled to the client's rate, unsigned 8 bit.
 
 mod chunk;
+mod resample;
+mod rtltcp;
 mod sdrc;
 mod spectrum;
 mod state;
@@ -45,6 +50,10 @@ struct Args {
     /// Who may retune: the operator in the front end, or the clients.
     #[arg(long, value_enum, default_value_t = Lead::Frontend)]
     lead: Lead,
+    /// Where rtl_tcp clients connect, host:port, or `off`. DAB programs tune
+    /// themselves: run with `--lead client` for them.
+    #[arg(long, default_value = "127.0.0.1:1234")]
+    rtltcp: String,
 }
 
 struct Bridge {
@@ -52,6 +61,8 @@ struct Bridge {
     /// property_changed lines for every client.
     events: broadcast::Sender<String>,
     iq: broadcast::Sender<Bytes>,
+    /// The TCI server's IQ as it came, for the rtl_tcp side.
+    iq_raw: broadcast::Sender<Arc<rtltcp::RawIq>>,
     audio: broadcast::Sender<Bytes>,
     spectrum: broadcast::Sender<Bytes>,
     /// Commands for the TCI server.
@@ -88,6 +99,16 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if args.rtltcp != "off" {
+        match TcpListener::bind(&args.rtltcp).await {
+            Ok(l) => {
+                tracing::info!(listen = %args.rtltcp, "rtl_tcp up");
+                let (iq, to_tci) = (bridge.iq_raw.clone(), bridge.to_tci.clone());
+                tokio::spawn(rtltcp::serve(l, iq, to_tci, args.lead));
+            }
+            Err(e) => tracing::warn!("rtl_tcp off, cannot listen on {}: {e}", args.rtltcp),
+        }
+    }
     tracing::info!(listen = %args.listen, tci = %args.tci, lead = ?args.lead, "TCI_transcode up");
     serve(listener, bridge).await;
 }
@@ -98,6 +119,7 @@ fn new_bridge(lead: Lead) -> (Arc<Bridge>, mpsc::UnboundedReceiver<String>) {
         state: Mutex::new(State::new(lead)),
         events: broadcast::channel(256).0,
         iq: broadcast::channel(64).0,
+        iq_raw: broadcast::channel(512).0,
         audio: broadcast::channel(64).0,
         spectrum: broadcast::channel(16).0,
         to_tci,
@@ -189,6 +211,10 @@ async fn tci_link(
                                 tci::payload_f32(&b, &mut samples);
                                 match h.stream {
                                     tci::Stream::Iq => {
+                                        if bridge.iq_raw.receiver_count() > 0 {
+                                            let raw = rtltcp::RawIq { rate: h.sample_rate, data: samples.clone() };
+                                            let _ = bridge.iq_raw.send(Arc::new(raw));
+                                        }
                                         if let Some(frame) = iq_chunks.push(&samples, h.sample_rate) {
                                             let _ = bridge.iq.send(Bytes::from(sdrc::iq_frame(&frame)));
                                         }
@@ -482,5 +508,58 @@ mod e2e {
         let seen = seen.lock().unwrap();
         assert!(seen.contains(&"iq_samplerate:250000".to_string()), "{seen:?}");
         assert!(seen.contains(&"vfo:0,0,433950000".to_string()), "{seen:?}");
+    }
+
+    /// rtl_tcp end to end: header, rate and frequency commands reach the TCI
+    /// server, and the 8-bit stream carries the fake server's tone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rtl_tcp_header_commands_and_tone() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let tci_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tci_addr = tci_listener.local_addr().unwrap().to_string();
+        tokio::spawn(fake_tci(tci_listener, seen.clone()));
+        let (bridge, from_bridge) = new_bridge(Lead::Client);
+        tokio::spawn(tci_link(bridge.clone(), tci_addr, 250_000, from_bridge));
+        let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let raddr = rl.local_addr().unwrap();
+        let (iq, to_tci) = (bridge.iq_raw.clone(), bridge.to_tci.clone());
+        tokio::spawn(rtltcp::serve(rl, iq, to_tci, Lead::Client));
+
+        let bytes = timeout(Duration::from_secs(10), async {
+            let mut s = TcpStream::connect(raddr).await.unwrap();
+            let mut head = [0u8; 12];
+            s.read_exact(&mut head).await.unwrap();
+            assert_eq!(&head[..4], b"RTL0");
+            let mut cmd = vec![0x02];
+            cmd.extend_from_slice(&2_048_000u32.to_be_bytes());
+            cmd.push(0x01);
+            cmd.extend_from_slice(&433_950_000u32.to_be_bytes());
+            s.write_all(&cmd).await.unwrap();
+            // Past the AGC's settling, then a stretch to measure.
+            let mut buf = vec![0u8; 2_000_000];
+            s.read_exact(&mut buf).await.unwrap();
+            buf
+        })
+        .await
+        .expect("rtl_tcp run timed out");
+
+        let seen = seen.lock().unwrap();
+        assert!(seen.contains(&"iq_samplerate:2048000".to_string()), "{seen:?}");
+        assert!(seen.contains(&"dds:0,433950000".to_string()), "{seen:?}");
+        // The tone's frequency from the mean phase step of the last 0.25 MB.
+        let tail = &bytes[bytes.len() - 500_000..];
+        let c: Vec<(f64, f64)> =
+            tail.chunks(2).map(|v| (v[0] as f64 - 127.5, v[1] as f64 - 127.5)).collect();
+        let (mut re, mut im) = (0.0, 0.0);
+        for w in c.windows(2) {
+            re += w[1].0 * w[0].0 + w[1].1 * w[0].1;
+            im += w[1].1 * w[0].0 - w[1].0 * w[0].1;
+        }
+        let f = im.atan2(re) * 2_048_000.0 / std::f64::consts::TAU;
+        assert!((f - TONE_OFFSET).abs() < 200.0, "tone at {f:.0} Hz");
+        let power = c.iter().map(|v| v.0 * v.0 + v.1 * v.1).sum::<f64>() / c.len() as f64;
+        let rms = power.sqrt() / 127.5;
+        assert!(rms > 0.1 && rms < 0.3, "level {rms}");
     }
 }

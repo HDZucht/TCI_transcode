@@ -1,7 +1,7 @@
 ---
 title: TCI_transcode — a TCI receiver offered as the SDRconnect WebSocket API
 type: software
-version: 0.1.0
+version: 0.1.1
 status: mvp-stage-1
 created: 2026-11-14
 author: Hans-Dieter Zucht with Argus (33feb1a0) (Claude Opus 5.5)
@@ -24,6 +24,8 @@ SDR Oxide (TCI server, port 50001) ──► TCI_transcode ──► SDRconnect 
 - **Who tunes:** `--lead frontend` (default) answers a client's tuning with the unchanged value; `--lead client` forwards it as `vfo:`, `dds:` or `modulation:`. The IQ rate (`device_sample_rate`) is the bridge's own subscription and is always the client's to choose.
 - Properties without a TCI counterpart (squelch, AGC, NR, LNA, antenna, display range, filter bandwidth) are stored and echoed; they act on nothing.
 
+- **rtl_tcp out (0.1.1, `--rtltcp`, default `127.0.0.1:1234`, `off` to disable):** the same IQ for programs written for an RTL-SDR on the network (AbracaDABra for DAB, SDR++, GQRX, welle.io, rtl_433 `-d rtl_tcp:…`; SoapySDR programs through SoapyRTLTCP). Header `RTL0` as an R820T with 29 gain steps; frequency (`0x01`) becomes `vfo:` and `dds:` when `--lead client`, sample rate (`0x02`) becomes `iq_samplerate:`; gain, AGC, ppm, bias-T and the rest are accepted and ignored. The IQ is resampled to exactly the client's rate (a TCI server snaps to an integer share of its hardware rate: SDR Oxide at 10 MS/s gives 2.000 for 2.048) by a 32-tap windowed-sinc, and scaled to unsigned 8 bit by a slow AGC (RMS −15 dBFS). Measured 2026-11-16 on SDR Oxide with a RSP1A at 10 MS/s: 2,048,350 samples/s over 30 s, longest pause 64 ms, nothing clipped.
+
 Not yet: the workbench web page and process API, a file source, a second tuner, device selection, recording, profiles.
 
 ## Run
@@ -33,6 +35,8 @@ Not yet: the workbench web page and process API, a file source, a second tuner, 
 cargo run --release -- --tci 127.0.0.1:50001 --listen 127.0.0.1:5454 --iq-rate 500000
 msdr --host 127.0.0.1 --port 5454
 ```
+
+DAB with AbracaDABra: run the bridge with `--lead client` (the DAB program tunes the ensemble itself) and choose RTL-TCP, 127.0.0.1, port 1234 in AbracaDABra. The TCI server needs a hardware rate of at least 2.048 MS/s; 6.144 MS/s gives 2.048 exactly.
 
 Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the IQ window, and SDR Oxide places the IQ centre beside the VFO (about 28 kHz off).
 

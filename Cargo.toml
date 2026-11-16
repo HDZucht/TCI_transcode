@@ -1,6 +1,6 @@
 [package]
 name = "tci_transcode"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Translates a TCI receiver (e.g. SDR Oxide) into the published SDRconnect WebSocket API 1.0.3, so decoder programs written for that API run against any TCI source."
 license = "MIT"
