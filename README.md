@@ -60,6 +60,8 @@ tci_transcode --tci 127.0.0.1:50001 --lead client --rtltcp 127.0.0.1:1234
 - SDR Oxide sits 1 MHz above the channel (offset tuning keeps the RSP1A's DC spike out of the block); the bridge takes the 6 MS/s TCI stream, shifts the channel to zero and cuts out 2.048 MS/s.
 - Load, per process in percent of one core: TCI_transcode about 10 % (25 MB), SDR Oxide about 29 %, AbracaDABra about 11 %; the whole chain uses about 4 % of the machine.
 
+![SDR Oxide on the Mac mini M6: RSP1A at 6 MS/s, two DAB+ blocks in Band III, the receiver tuned 1 MHz above channel 9A while AbracaDABra plays it](docs/use-case-a/sdroxide-rsp1a-6msps-two-dab-blocks.png)
+
 ![SDR Oxide: RSP1A tuned 1 MHz above DAB channel 9A](docs/use-case-a/sdroxide-rsp1a-offset-tuning.png)
 
 ![AbracaDABra: ensemble WDR Regional on 9A through TCI_transcode, RS uncorrectable 0](docs/use-case-a/abracadabra-ensemble-wdr-regional-9a.png)
