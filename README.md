@@ -36,7 +36,9 @@ cargo run --release -- --tci 127.0.0.1:50001 --listen 127.0.0.1:5454 --iq-rate 5
 msdr --host 127.0.0.1 --port 5454
 ```
 
-DAB with AbracaDABra: run the bridge with `--lead client` (the DAB program tunes the ensemble itself) and choose RTL-TCP, 127.0.0.1, port 1234 in AbracaDABra. The TCI server needs a hardware rate of at least 2.048 MS/s; 6.144 MS/s gives 2.048 exactly.
+DAB with AbracaDABra: run the bridge with `--lead client` (the DAB program tunes the ensemble itself) and choose RTL-TCP, 127.0.0.1, port 1234 in AbracaDABra. Gain is set by hand in the TCI front end (TCI has no gain command; the client's gain steps are ignored).
+
+Offset tuning (`--rtltcp-offset-khz`, default 1000): the hardware centre goes 1 MHz above the client's frequency so the receiver's DC spike stays outside the DAB block (±768 kHz); the bridge asks TCI for a stream wide enough (about 4.5 MS/s), shifts the client's frequency to zero from the centre the server reports, and cuts 2.048 MS/s out of it. The radio therefore needs a hardware rate of at least about 5 MS/s; below that the client falls back to tuning on the frequency (logged). First light 2026-11-16: SDR Oxide, RSP1A at 6 MS/s, channel 6A (181.936 MHz), AbracaDABra found the ensemble with 16 services; shift −1,028,125 Hz (1 MHz plus SDR Oxide's own 28 kHz).
 
 Use 500 kS/s for rtl_433 in msdr: it wants ±100 kHz around the VFO inside the IQ window, and SDR Oxide places the IQ centre beside the VFO (about 28 kHz off).
 

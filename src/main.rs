@@ -54,6 +54,11 @@ struct Args {
     /// themselves: run with `--lead client` for them.
     #[arg(long, default_value = "127.0.0.1:1234")]
     rtltcp: String,
+    /// How far above an rtl_tcp client's frequency the hardware centre goes,
+    /// so the receiver's DC spike stays out of the client's band; 0 tunes on
+    /// the frequency itself.
+    #[arg(long, default_value_t = 1000)]
+    rtltcp_offset_khz: i64,
 }
 
 struct Bridge {
@@ -104,7 +109,8 @@ async fn main() {
             Ok(l) => {
                 tracing::info!(listen = %args.rtltcp, "rtl_tcp up");
                 let (iq, to_tci) = (bridge.iq_raw.clone(), bridge.to_tci.clone());
-                tokio::spawn(rtltcp::serve(l, iq, to_tci, args.lead));
+                let tuning = rtltcp::Tuning { lead: args.lead, offset_hz: args.rtltcp_offset_khz * 1000 };
+                tokio::spawn(rtltcp::serve(l, iq, to_tci, tuning));
             }
             Err(e) => tracing::warn!("rtl_tcp off, cannot listen on {}: {e}", args.rtltcp),
         }
@@ -212,7 +218,8 @@ async fn tci_link(
                                 match h.stream {
                                     tci::Stream::Iq => {
                                         if bridge.iq_raw.receiver_count() > 0 {
-                                            let raw = rtltcp::RawIq { rate: h.sample_rate, data: samples.clone() };
+                                            let center_hz = bridge.state.lock().unwrap().center_hz;
+                                            let raw = rtltcp::RawIq { rate: h.sample_rate, center_hz, data: samples.clone() };
                                             let _ = bridge.iq_raw.send(Arc::new(raw));
                                         }
                                         if let Some(frame) = iq_chunks.push(&samples, h.sample_rate) {
@@ -524,7 +531,8 @@ mod e2e {
         let rl = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let raddr = rl.local_addr().unwrap();
         let (iq, to_tci) = (bridge.iq_raw.clone(), bridge.to_tci.clone());
-        tokio::spawn(rtltcp::serve(rl, iq, to_tci, Lead::Client));
+        let tuning = rtltcp::Tuning { lead: Lead::Client, offset_hz: 0 };
+        tokio::spawn(rtltcp::serve(rl, iq, to_tci, tuning));
 
         let bytes = timeout(Duration::from_secs(10), async {
             let mut s = TcpStream::connect(raddr).await.unwrap();
@@ -557,7 +565,11 @@ mod e2e {
             im += w[1].1 * w[0].0 - w[1].0 * w[0].1;
         }
         let f = im.atan2(re) * 2_048_000.0 / std::f64::consts::TAU;
-        assert!((f - TONE_OFFSET).abs() < 200.0, "tone at {f:.0} Hz");
+        // The fake server keeps its centre at CENTER, so the bridge shifts the
+        // stream to the client's 433.95 MHz: the tone 20 kHz above the centre
+        // shows 30 kHz below the client's frequency.
+        let want = TONE_OFFSET - (433_950_000 - CENTER) as f64;
+        assert!((f - want).abs() < 200.0, "tone at {f:.0} Hz, want {want:.0}");
         let power = c.iter().map(|v| v.0 * v.0 + v.1 * v.1).sum::<f64>() / c.len() as f64;
         let rms = power.sqrt() / 127.5;
         assert!(rms > 0.1 && rms < 0.3, "level {rms}");
