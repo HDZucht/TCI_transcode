@@ -70,6 +70,31 @@ tci_transcode --tci 127.0.0.1:50001 --lead client --rtltcp 127.0.0.1:1234
 
 The TCI server needed one fix for this, in SDR Oxide itself: on macOS its client sockets were left non-blocking and dropped clients at high IQ rates (PR to SDR Oxide prepared).
 
+## Use case B: two ADS-B decoders on one receiver — SDR Oxide and SDRangel at the same time
+
+SDR Oxide as the device provider, SDRangel as one more decoder on the same stick. 2026-11-16, same Mac mini M6. A Nooelec RTL-SDR (R820T) runs in SDR Oxide at 2.4 MS/s on 1090 MHz with an external 40 dB amplifier and a telescopic antenna (20.6 cm, ¾ λ) at the window; LNA at 19 dB. SDR Oxide decodes ADS-B itself; at the same time its TCI server (127.0.0.1:50003) feeds TCI_transcode, and SDRangel 8.2 decodes the same stream through its *RemoteTCPInput* (rtl_tcp).
+
+```sh
+tci_transcode --tci 127.0.0.1:50003 --listen 127.0.0.1:5455 --lead client --rtltcp 127.0.0.1:1235
+# SDRangel: device RemoteTCPInput, 127.0.0.1 : 1235, protocol SDRangel, 1090 MHz, 2.4 MS/s, DC on;
+#           channel ADS-B Demodulator, SR 4, threshold 1
+```
+
+| at the same minute | SDR Oxide (own decoder) | SDRangel (through TCI_transcode) |
+|---|---|---|
+| aircraft | 9 (9,643 frames) | 7 |
+| with call sign | THY2CK, EWG33F, WMT7NR, QTR284, LGL5436 | EWG33F, LGL5436, THY2CK, WMT7NR |
+
+- The stick's LNA and IF gains were easiest to tune in SDR Oxide, with its waterfall and its own decoder counting frames: from LNA 28 dB (near aircraft at full scale) down to 19 dB the count rose in both decoders.
+- One receiver, two decoders, neither knows of the other: SDR Oxide keeps its own map and list, SDRangel adds its aircraft database (type, operator, side view), the airports and its coverage map.
+- A second bridge on its own ports runs beside the first: the same evening a RX-888 in SDR Oxide (TCI 127.0.0.1:50002 → rtl_tcp 1234) fed another SDRangel input.
+- The RTL-SDR's 2.4 MS/s are too narrow for offset tuning (that needs about 4.4 MS/s for a 2 MS/s client); the bridge falls back to tuning on the frequency after 1.5 s and SDRangel's DC correction takes the spike out.
+- SDRangel sees an RTL-SDR (R820T, 8 bits), so it offers at most 3.2 MS/s; for ADS-B that is enough.
+
+![SDR Oxide: RTL-SDR on 1090 MHz, its own ADS-B decoder with 9 aircraft, while the TCI server feeds TCI_transcode](docs/use-case-b/sdroxide-rtlsdr-adsb-own-decoder.png)
+
+![SDRangel: ADS-B Demodulator on the same stream through TCI_transcode, 7 aircraft with type, operator and coverage map](docs/use-case-b/sdrangel-adsb-via-tci-transcode-rtlsdr.png)
+
 ## Limits
 
 - **Gain:** TCI has no command for the receiver's gain. The gain steps an rtl_tcp client sends (AbracaDABra steps through them) are ignored; set the gain in the TCI front end by hand.
